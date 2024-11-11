@@ -15,10 +15,9 @@ use super::{
     error::{Error, Result},
     message::*,
 };
-use crate::driver::crypto::TAG_SIZE;
 use crate::{
     constants::*,
-    driver::MixMode,
+    driver::{CryptoMode, MixMode},
     events::EventStore,
     input::{Input, Parsed},
     tracks::{Action, LoopState, PlayError, PlayMode, TrackCommand, TrackHandle, TrackState, View},
@@ -511,6 +510,15 @@ impl Mixer {
         }
     }
 
+    pub fn crypto_mode(&self) -> CryptoMode {
+        let mode = self.conn_active.as_ref().map(|v| v.crypto_state.kind());
+        if cfg!(not(test)) {
+            mode.expect("Shouldn't be mixing packets without access to a cipher + UDP dest.")
+        } else {
+            mode.unwrap_or_else(|| self.config.crypto_mode)
+        }
+    }
+
     #[inline]
     pub fn mix_and_build_packet(&mut self, packet: &mut [u8]) -> Result<usize> {
         // symph_mix is an `AudioBuffer` (planar format), we need to convert this
@@ -545,8 +553,9 @@ impl Mixer {
                 );
 
                 let payload = rtp.payload_mut();
+                let pre_len = self.crypto_mode().payload_prefix_len2();
 
-                payload[TAG_SIZE..TAG_SIZE + SILENT_FRAME.len()].copy_from_slice(&SILENT_FRAME[..]);
+                payload[pre_len..pre_len + SILENT_FRAME.len()].copy_from_slice(&SILENT_FRAME[..]);
 
                 mix_len = MixType::Passthrough(SILENT_FRAME.len());
             } else {
@@ -580,7 +589,8 @@ impl Mixer {
                             (Blame: VOICE_PACKET_MAX?)",
                     );
                     let payload = rtp.payload();
-                    let opus_frame = (payload[TAG_SIZE..][..len]).to_vec();
+                    let opus_frame =
+                        (payload[self.crypto_mode().payload_prefix_len2()..][..len]).to_vec();
 
                     OutputMessage::Passthrough(opus_frame)
                 },
@@ -626,6 +636,7 @@ impl Mixer {
 
         let payload = rtp.payload_mut();
         let crypto_mode = conn.crypto_state.kind();
+        let first_payload_byte = crypto_mode.payload_prefix_len2();
 
         // If passthrough, Opus payload in place already.
         // Else encode into buffer with space for AEAD encryption headers.
@@ -635,14 +646,14 @@ impl Mixer {
                 let total_payload_space = payload.len() - crypto_mode.payload_suffix_len();
                 self.encoder.encode_float(
                     &send_buffer[..self.config.mix_mode.sample_count_in_frame()],
-                    &mut payload[TAG_SIZE..total_payload_space],
+                    &mut payload[first_payload_byte..total_payload_space],
                 )?
             },
         };
 
         let final_payload_size = conn
             .crypto_state
-            .write_packet_nonce(&mut rtp, TAG_SIZE + payload_len);
+            .write_packet_nonce(&mut rtp, first_payload_byte + payload_len);
 
         // Packet encryption ignored in test modes.
         #[cfg(not(test))]
@@ -651,11 +662,8 @@ impl Mixer {
         let encrypt = self.config.override_connection.is_none();
 
         if encrypt {
-            conn.crypto_state.kind().encrypt_in_place(
-                &mut rtp,
-                &conn.cipher,
-                final_payload_size,
-            )?;
+            conn.cipher
+                .encrypt_pkt_in_place(&mut rtp, final_payload_size)?;
         }
 
         Ok(RtpPacket::minimum_packet_size() + final_payload_size)
@@ -746,7 +754,7 @@ impl Mixer {
                 (Blame: VOICE_PACKET_MAX?)",
         );
         let payload = rtp.payload_mut();
-        let opus_frame = &mut payload[TAG_SIZE..];
+        let opus_frame = &mut payload[self.crypto_mode().payload_prefix_len2()..];
 
         // Opus frame passthrough.
         // This requires that we have only one PLAYING track, who has volume 1.0, and an

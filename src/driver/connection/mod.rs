@@ -3,6 +3,7 @@ pub mod error;
 #[cfg(feature = "receive")]
 use super::tasks::udp_rx;
 use super::{
+    crypto::Cipher,
     tasks::{
         message::*,
         ws::{self as ws_task, AuxNetwork},
@@ -20,7 +21,6 @@ use crate::{
     ws::WsStream,
     ConnectionInfo,
 };
-use crypto_secretbox::{KeyInit, XSalsa20Poly1305 as Cipher};
 use discortp::discord::{IpDiscoveryPacket, IpDiscoveryType, MutableIpDiscoveryPacket};
 use error::{Error, Result};
 use flume::Sender;
@@ -103,9 +103,12 @@ impl Connection {
         let ready =
             ready.expect("Ready packet expected in connection initialisation, but not found.");
 
-        if !has_valid_mode(&ready.modes, config.crypto_mode) {
-            return Err(Error::CryptoModeUnavailable);
-        }
+        let chosen_crypto = CryptoMode::negotiate(&ready.modes, Some(config.crypto_mode))?;
+
+        info!(
+            "Crypto scheme negotiation -- wanted {:?}. Chose {:?} from modes {:?}.",
+            config.crypto_mode, chosen_crypto, ready.modes
+        );
 
         let udp = UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -115,7 +118,7 @@ impl Connection {
         } else {
             let socket = Socket::from(udp.into_std()?);
 
-            // Some operating systems does not allow setting the recv buffer to 0.
+            // Some operating systems do not allow setting the recv buffer to 0.
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             socket.set_recv_buffer_size(0)?;
 
@@ -159,28 +162,25 @@ impl Connection {
             let address_str = std::str::from_utf8(&view.get_address_raw()[..nul_byte_index])
                 .map_err(|_| Error::IllegalIp)?;
 
-            let address = IpAddr::from_str(address_str).map_err(|e| {
-                println!("{e:?}");
-                Error::IllegalIp
-            })?;
+            let address = IpAddr::from_str(address_str).map_err(|_| Error::IllegalIp)?;
 
             client
                 .send_json(&GatewayEvent::from(SelectProtocol {
                     protocol: "udp".into(),
                     data: ProtocolData {
                         address,
-                        mode: config.crypto_mode.to_request_str().into(),
+                        mode: chosen_crypto.to_request_str().into(),
                         port: view.get_port(),
                     },
                 }))
                 .await?;
         }
 
-        let cipher = init_cipher(&mut client, config.crypto_mode).await?;
+        let cipher = init_cipher(&mut client, chosen_crypto).await?;
 
         info!("Connected to: {}", info.endpoint);
 
-        info!("WS heartbeat duration {}ms.", hello.heartbeat_interval,);
+        info!("WS heartbeat duration {}ms.", hello.heartbeat_interval);
 
         let (ws_msg_tx, ws_msg_rx) = flume::unbounded();
         #[cfg(feature = "receive")]
@@ -209,7 +209,7 @@ impl Connection {
             cipher: cipher.clone(),
             #[cfg(not(feature = "receive"))]
             cipher,
-            crypto_state: config.crypto_mode.into(),
+            crypto_state: chosen_crypto.into(),
             #[cfg(feature = "receive")]
             udp_rx: udp_receiver_msg_tx,
             udp_tx,
@@ -244,6 +244,7 @@ impl Connection {
             interconnect.clone(),
             udp_receiver_msg_rx,
             cipher,
+            chosen_crypto,
             config.clone(),
             udp_rx,
             ssrc_tracker,
@@ -349,7 +350,8 @@ async fn init_cipher(client: &mut WsStream, mode: CryptoMode) -> Result<Cipher> 
                     return Err(Error::CryptoModeInvalid);
                 }
 
-                return Cipher::new_from_slice(&desc.secret_key)
+                return mode
+                    .cipher_from_key(&desc.secret_key)
                     .map_err(|_| Error::CryptoInvalidLength);
             },
             other => {
@@ -361,13 +363,4 @@ async fn init_cipher(client: &mut WsStream, mode: CryptoMode) -> Result<Cipher> 
             },
         }
     }
-}
-
-#[inline]
-fn has_valid_mode<T, It>(modes: It, mode: CryptoMode) -> bool
-where
-    T: for<'a> PartialEq<&'a str>,
-    It: IntoIterator<Item = T>,
-{
-    modes.into_iter().any(|s| s == mode.to_request_str())
 }
