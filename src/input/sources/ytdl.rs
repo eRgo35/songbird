@@ -39,6 +39,7 @@ pub struct YoutubeDl {
     client: Client,
     metadata: Option<AuxMetadata>,
     query: QueryType,
+    user_args: Vec<String>,
 }
 
 impl YoutubeDl {
@@ -61,6 +62,7 @@ impl YoutubeDl {
             client,
             metadata: None,
             query: QueryType::Url(url),
+            user_args: Vec::new(),
         }
     }
 
@@ -80,7 +82,15 @@ impl YoutubeDl {
             client,
             metadata: None,
             query: QueryType::Search(query),
+            user_args: Vec::new(),
         }
+    }
+
+    /// Sets additional arguments for the "yt-dlp" process
+    #[must_use]
+    pub fn user_args(mut self, user_args: Vec<String>) -> Self {
+        self.user_args = user_args;
+        self
     }
 
     /// Runs a search for the given query, returning a list of up to `n_results`
@@ -123,6 +133,7 @@ impl YoutubeDl {
         ];
 
         let mut output = Command::new(self.program)
+            .args(self.user_args.clone())
             .args(ytdl_args)
             .output()
             .await
